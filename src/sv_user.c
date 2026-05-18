@@ -644,7 +644,8 @@ static void Cmd_Modellist_f (void)
 	maxclientsupportedmodels = 256;
 #ifdef FTE_PEXT_MODELDBL
 	if (sv_client->fteprotocolextensions & FTE_PEXT_MODELDBL) {
-		maxclientsupportedmodels *= 2;
+		// Artificial limit, ids are sent as short, increase if needed
+		maxclientsupportedmodels *= 8;
 	}
 #endif
 
@@ -3586,7 +3587,9 @@ static void SV_ApplySafestrafe(client_t *cl, usercmd_t *ucmd)
 	if (current_dir != 0 && previous_dir != 0 && 
 	    current_dir != previous_dir) {
 		// Direct direction change - enforce stop frames
-		cl->safestrafe.pending_frames = required_frames;
+		cl->safestrafe.pending_frames = required_frames - 1;
+		if (cl->safestrafe.pending_frames < 0)
+			cl->safestrafe.pending_frames = 0;
 		cl->safestrafe.pending_direction = current_move;
 		cl->safestrafe.stop_frames = 1;
 		ucmd->sidemove = 0;
@@ -3595,10 +3598,12 @@ static void SV_ApplySafestrafe(client_t *cl, usercmd_t *ucmd)
 		// Starting movement after stop
 		if (cl->safestrafe.stop_frames < required_frames) {
 			// Not enough stop frames
-			cl->safestrafe.pending_frames = 
-				required_frames - cl->safestrafe.stop_frames;
 			cl->safestrafe.pending_direction = current_move;
 			cl->safestrafe.stop_frames++;
+			cl->safestrafe.pending_frames = 
+				required_frames - cl->safestrafe.stop_frames;
+			if (cl->safestrafe.pending_frames < 0)
+				cl->safestrafe.pending_frames = 0;
 			ucmd->sidemove = 0;
 		}
 		else {
