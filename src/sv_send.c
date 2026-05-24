@@ -1147,6 +1147,10 @@ void SV_SendClientMessages (void)
 			}
 		}
 
+#ifdef MVD_PEXT1_SPRAYS
+		SV_SpraysSendPending(c);
+#endif
+
 #ifdef USE_PR2
 		if (c->isBot) {
 			// Write damage to bot clients too (for mvd playback)
@@ -1403,6 +1407,10 @@ void SV_SendDemoMessage(void)
 	}
 
 	SZ_Clear (&demo.datagram);
+
+#ifdef MVD_PEXT1_SPRAYS
+	SV_SpraysRecordPending();
+#endif
 
 	demo.recorder.delta_sequence = demo.recorder.netchan.incoming_sequence&255;
 	demo.recorder.netchan.incoming_sequence++;
