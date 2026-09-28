@@ -20,6 +20,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #ifndef CLIENTONLY
+#include <math.h>
 #include "qwsvdef.h"
 
 #ifdef SERVERONLY
@@ -53,6 +54,14 @@ cvar_t	sv_maxfps = {"maxfps", "77", CVAR_SERVERINFO};  // It actually should be 
 
 void OnChange_sysselecttimeout_var (cvar_t *var, char *value, qbool *cancel);
 cvar_t	sys_select_timeout = {"sys_select_timeout", "10000", 0, OnChange_sysselecttimeout_var}; // microseconds.
+
+// connection smoothing: pace a client's packets to a minimum interval before
+// processing them, see sv_smooth.h
+cvar_t	sv_smooth = {"sv_smooth", "1"};              // 0 clients with "setinfo smooth 1", 1 everyone, 2 everyone except "setinfo smooth 0"
+cvar_t	sv_smooth_interval = {"sv_smooth_interval", "12.987012987012987"}; // ms between processed packets until the client's rate is measured; 1000/77
+cvar_t	sv_smooth_catchup = {"sv_smooth_catchup", "50"}; // ms of backlog above which the queue drains at double rate
+cvar_t	sv_smooth_maxdelay = {"sv_smooth_maxdelay", "200"}; // ms after which a queued packet is dropped
+cvar_t	sv_smooth_drain = {"sv_smooth_drain", "10"};        // most a slot is shortened to drain slack, percent
 
 cvar_t	sys_restart_on_error = {"sys_restart_on_error", "0"};
 cvar_t  sv_mod_extensions = { "sv_mod_extensions", "2", CVAR_ROM };
@@ -335,6 +344,105 @@ void SV_FreeDelayedPackets (client_t *cl) {
 		SV_FreeHeadDelayedPacket(cl);
 }
 
+// Queues the packet in net_message for the client; false when out of buffers.
+static qbool SV_QueueDelayedPacket (client_t *cl, double time)
+{
+	if (!svs.free_packets)
+		return false;
+
+	// insert at end of list
+	if (!cl->packets) {
+		cl->last_packet = cl->packets = svs.free_packets;
+	} else {
+		// this works because '=' associates from right to left
+		cl->last_packet = cl->last_packet->next = svs.free_packets;
+	}
+
+	svs.free_packets = svs.free_packets->next;
+	cl->last_packet->next = NULL;
+
+	cl->last_packet->time = time;
+	SZ_Clear(&cl->last_packet->msg);
+	SZ_Write(&cl->last_packet->msg, net_message.data, net_message.cursize);
+	return true;
+}
+
+// Whether the client's packets are smoothed. Smoothing is always available:
+// sv_smooth 0 needs "setinfo smooth 1", 1 smooths everyone, 2 smooths everyone
+// except clients with "setinfo smooth 0".
+qbool SV_ClientSmoothed (client_t *cl)
+{
+	const char *key = Info_Get(&cl->_userinfo_ctx_, "smooth");
+
+	switch ((int)sv_smooth.value)
+	{
+		case 0: return Q_atoi(key) != 0;
+		case 1: return true;
+		default: return !key[0] || Q_atoi(key) != 0;
+	}
+}
+
+static void SV_SmoothConfig (smooth_config_t *cfg)
+{
+	Smooth_Config(cfg, sv_smooth_interval.value, sv_smooth_catchup.value, sv_smooth_maxdelay.value, sv_smooth_drain.value);
+}
+
+static void SV_ExecuteDelayedPacket (client_t *cl)
+{
+	SZ_Clear(&net_message);
+	SZ_Write(&net_message, cl->packets->msg.data, cl->packets->msg.cursize);
+	SV_ExecuteClientMessage(cl);
+	SV_FreeHeadDelayedPacket(cl);
+}
+
+// Processes the smoothed client's queued packets whose slot has come, dropping
+// stale ones first. With `drain` everything goes at once.
+static void SV_ReleaseSmoothedPackets (client_t *cl, qbool drain, const smooth_config_t *cfg)
+{
+	while (cl->packets)
+	{
+		double arrived = cl->packets->time;
+
+		if (!drain && Smooth_Stale(curtime, arrived, cfg))
+		{
+			SV_FreeHeadDelayedPacket(cl);
+			Smooth_Dropped(&cl->smooth, curtime);
+			continue;
+		}
+		if (!drain && !Smooth_Due(&cl->smooth, curtime))
+			break;
+
+		SV_ExecuteDelayedPacket(cl);
+		// drained packets may have been queued on the minping clock, so their
+		// wait is not measured
+		if (!drain)
+			Smooth_Released(&cl->smooth, curtime, arrived, cl->packets != NULL, cl->packets ? cl->packets->time : 0, cfg);
+	}
+}
+
+// How long the main loop may sleep, in microseconds, before a smoothed packet
+// is due. Microseconds, not milliseconds: rounding a release up to the next
+// millisecond would show as jitter in the spacing between packets.
+int SV_SmoothSleepUs (int max_us)
+{
+	client_t *cl;
+	double now, wait = max_us / 1000000.0;
+	int i;
+
+	if (sv.state != ss_active)
+		return max_us;
+
+	now = Sys_DoubleTime();
+	for (i = 0, cl = svs.clients; i < MAX_CLIENTS; i++, cl++)
+	{
+		if (cl->state == cs_free || !cl->smooth.active || !cl->packets)
+			continue;
+		if (cl->smooth.next_release - now < wait)
+			wait = cl->smooth.next_release - now;
+	}
+	return wait <= 0 ? 0 : (int)ceil(wait * 1000000);
+}
+
 /*
 ==================
 SV_FinalMessage
@@ -427,6 +535,10 @@ void SV_DropClient(client_t* drop)
 	*drop->uploadfn = 0;
 
 	SV_Logout(drop);
+
+	// queued packets belong to the pool, and would otherwise be executed
+	// for the zombie and leaked when the slot is reused
+	SV_FreeDelayedPackets(drop);
 
 	drop->state = cs_zombie;		    // become free in a few seconds
 	SV_SetClientConnectionTime(drop);   // for zombie timeout
@@ -1378,7 +1490,9 @@ static void SVC_DirectConnect (void)
 	// build a new connection
 	// accept the new client
 	// this is the only place a client_t is ever initialized
+	SV_FreeDelayedPackets(newcl); // packets still queued would leak from the pool
 	memset (newcl, 0, sizeof(*newcl));
+	Smooth_Init(&newcl->smooth);
 
 	newcl->userid = SV_GenerateUserID();
 
@@ -2972,26 +3086,47 @@ SV_ReadPackets
 static void SV_ReadPackets (void)
 {
 	client_t *cl;
+	smooth_config_t cfg;
+	unsigned sequence;
+	qbool dupe;
 	int qport;
 	int i;
 
 	if (sv.state != ss_active)
 		return;
 
+	SV_SmoothConfig(&cfg);
+
 	// first deal with delayed packets from connected clients
 	for (i = 0, cl=svs.clients; i < MAX_CLIENTS; i++, cl++)
 	{
+		qbool smoothed;
+
 		if (cl->state == cs_free)
 			continue;
 
 		net_from = cl->netchan.remote_address;
 
+		// smoothing and minping delay keep different clocks, so hand over
+		// with an empty queue when a client switches between them
+		smoothed = SV_ClientSmoothed(cl);
+		if (smoothed != cl->smooth.active)
+		{
+			SV_ReleaseSmoothedPackets(cl, true, &cfg);
+			Smooth_Reset(&cl->smooth);
+			cl->smooth.active = smoothed;
+		}
+
+		if (smoothed)
+		{
+			SV_ReleaseSmoothedPackets(cl, false, &cfg);
+			continue;
+		}
+
 		while (cl->packets && (realtime - cl->packets->time >= cl->delay || sv.paused))
 		{
-			SZ_Clear(&net_message);
-			SZ_Write(&net_message, cl->packets->msg.data, cl->packets->msg.cursize);
-			SV_ExecuteClientMessage(cl);
-			SV_FreeHeadDelayedPacket(cl);
+			Smooth_Sent(&cl->smooth, curtime, curtime - (realtime - cl->packets->time));
+			SV_ExecuteDelayedPacket(cl);
 		}
 	}
 
@@ -3014,7 +3149,7 @@ static void SV_ReadPackets (void)
 		// read the qport out of the message so we can fix up
 		// stupid address translating routers
 		MSG_BeginReading ();
-		MSG_ReadLong (); // sequence number
+		sequence = MSG_ReadLong () & 0x7fffffff; // sequence number, without the reliable flag
 		MSG_ReadLong (); // sequence number
 		qport = MSG_ReadShort () & 0xffff;
 
@@ -3039,29 +3174,36 @@ static void SV_ReadPackets (void)
 		if (i == MAX_CLIENTS)
 			continue;
 
-		// ok, we know who sent this packet, but do we need to delay executing it?
-		if (cl->delay > 0)
+		// a copy of an earlier packet (cl_c2sdupe), or one the link reordered
+		// behind a newer one, serves no purpose once a later packet has arrived;
+		// the netchan would discard it as out of order anyway, so it must not
+		// take up a pacing slot or count as an arrival
+		dupe = cl->smooth.have_sequence && sequence <= cl->smooth.last_sequence;
+		if (dupe)
 		{
-			if (!svs.free_packets) // packet has to be dropped..
+			Smooth_Duplicate(&cl->smooth, curtime);
+			continue;
+		}
+		cl->smooth.last_sequence = sequence;
+		cl->smooth.have_sequence = true;
+
+		// ok, we know who sent this packet, but do we need to delay executing it?
+		Smooth_Arrived(&cl->smooth, curtime, cl->smooth.active ? &cfg : NULL);
+		if (cl->smooth.active)
+		{
+			if (!cl->packets && Smooth_PassThrough(&cl->smooth, curtime, &cfg))
+				SV_ExecuteClientMessage (cl);
+			else if (!SV_QueueDelayedPacket(cl, curtime))
+				Smooth_Dropped(&cl->smooth, curtime); // out of buffers
+		}
+		else if (cl->delay > 0)
+		{
+			if (!SV_QueueDelayedPacket(cl, realtime)) // packet has to be dropped..
 				break;
-
-			// insert at end of list
-			if (!cl->packets) {
-				cl->last_packet = cl->packets = svs.free_packets;
-			} else {
-				// this works because '=' associates from right to left
-				cl->last_packet = cl->last_packet->next = svs.free_packets;
-			}
-
-			svs.free_packets = svs.free_packets->next;
-			cl->last_packet->next = NULL;
-
-			cl->last_packet->time = realtime;
-			SZ_Clear(&cl->last_packet->msg);
-			SZ_Write(&cl->last_packet->msg, net_message.data, net_message.cursize);
 		}
 		else
 		{
+			Smooth_Sent(&cl->smooth, curtime, curtime);
 			SV_ExecuteClientMessage (cl);
 		}
 	}
@@ -3481,6 +3623,11 @@ void SV_InitLocal (void)
 
 	Cvar_Register (&sv_mintic);
 	Cvar_Register (&sv_maxtic);
+	Cvar_Register (&sv_smooth);
+	Cvar_Register (&sv_smooth_interval);
+	Cvar_Register (&sv_smooth_catchup);
+	Cvar_Register (&sv_smooth_maxdelay);
+	Cvar_Register (&sv_smooth_drain);
 	Cvar_Register (&sv_maxfps);
 	Cvar_Register (&sys_select_timeout);
 	Cvar_Register (&sys_restart_on_error);

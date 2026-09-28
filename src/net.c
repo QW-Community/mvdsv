@@ -1188,7 +1188,7 @@ int UDP_OpenSocket (unsigned short int port)
 	return newsocket;
 }
 
-qbool NET_Sleep(int msec, qbool stdinissocket)
+qbool NET_Sleep(int usec, qbool stdinissocket)
 {
 	struct timeval	timeout;
 	fd_set			fdset;
@@ -1209,8 +1209,8 @@ qbool NET_Sleep(int msec, qbool stdinissocket)
 		maxfd = max(svs.socketip, maxfd);
 	}
 
-	timeout.tv_sec = msec/1000;
-	timeout.tv_usec = (msec%1000)*1000;
+	timeout.tv_sec = usec / 1000000;
+	timeout.tv_usec = usec % 1000000;
 	switch (select(maxfd + 1, &fdset, NULL, NULL, &timeout))
 	{
 		case -1: break;
