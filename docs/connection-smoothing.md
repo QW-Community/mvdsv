@@ -90,6 +90,18 @@ the drain removes silently, while one slightly too short runs the queue dry
 and re-syncs the schedule to a clumped arrival, which is the jitter this
 whole mechanism exists to remove.
 
+The margin has a cost of its own, though: on a clean link it is pure slack,
+which the drain removes in a saw-tooth of up to a millisecond. A stock
+QuakeWorld client sends at precisely the configured 1000/77 ms, and the
+measurement of it wobbles by a few tenths of a percent as clumps enter and
+leave the window, so a client measured within half a percent faster than
+the configured rate, or within 0.05 % slower, is taken to be exactly at it
+and gets the configured interval with no margin. The band is asymmetric
+because the schedule must never be shorter than the client's interval, or
+the buffer a clumped link relies on drains away; the sliver on the slower
+side is what a clean link's measurement noise needs. Clients at other
+rates keep the margin.
+
 ### Drain slack by shortening slots, sized by the smallest recent wait
 
 With the schedule at the client's rate, the queue neither grows nor shrinks
@@ -102,7 +114,11 @@ The answer is the smallest wait among the releases of the last half second.
 If every packet in that period waited at least *m* ms, the schedule can be
 moved *m* ms earlier without any packet being due before it has arrived,
 and that *m* is precisely the slack. A pass-through counts as a wait of
-zero, so a period containing one has no slack to give.
+zero, so a period containing one has no slack to give, and it also
+forgets whatever drain was still pending: the queue ran dry, so there is
+nothing left to remove. Each period replaces the pending amount rather
+than adding to it, since slack still present at the end of a period is
+the same slack the previous period scheduled, not more of it.
 
 Rather than jumping the schedule by *m* at once, which would itself be a
 visible short gap, the slack is shaved off the following slots. Each slot
@@ -112,6 +128,9 @@ forever, and capped at `sv_smooth_drain` percent of a slot (default 10) so
 recovery from a lag event finishes in well under a second without making
 any single slot unreasonably short. The cap is a cvar because how fast to
 recover is a matter of taste that server operators may want to tune.
+Whatever the cap, a shave never exceeds half the slot, so a release never
+lands before the previous one was due, even in catch-up mode with the cap
+set high.
 
 ### Catch-up and dropping
 
@@ -167,9 +186,14 @@ two mechanisms the queue is drained first so the stamps never mix.
 The server's main loop sleeps in `select()` for up to `sys_select_timeout`
 when idle. A queued packet whose slot falls inside that sleep would be
 processed late, so the timeout is shortened to the earliest pending slot
-across all smoothed clients (`SV_SmoothSleepMs`). A late wake-up does not
-shift the schedule: slots are counted from when the previous one was due,
-so the next packet catches up rather than everything drifting late.
+across all smoothed clients (`SV_SmoothSleepUs`). The timeout is computed
+and passed in microseconds: `select()` honours that on Linux, where the
+kernel's high-resolution timers wake the loop within tens of microseconds,
+and rounding it up to whole milliseconds, as an earlier version did, made
+every release up to a millisecond late and showed as jitter in the spacing
+between packets. A late wake-up does not shift the schedule: slots are
+counted from when the previous one was due, so the next packet catches up
+rather than everything drifting late.
 
 ## Cost
 

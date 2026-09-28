@@ -240,6 +240,89 @@ static void test_interval_is_the_measured_rate_once_known (void)
 	CHECK_NEAR (Smooth_Interval (&s, 2.3, &cfg), 0.013);
 }
 
+static void test_a_client_near_the_configured_rate_is_taken_to_be_at_it (void)
+{
+	smooth_config_t cfg;
+	smooth_t s;
+	double t;
+	int i;
+
+	Smooth_Config (&cfg, 13, 50, 200, 10);
+	/* 12.96 ms gaps: 0.3% faster than the configured 13 ms, within the wobble. */
+	Smooth_Init (&s);
+	for (i = 0, t = 1.0; i <= 100; i++, t += 0.01296)
+		Smooth_Arrived (&s, t, &cfg);
+	CHECK_NEAR (Smooth_Interval (&s, t, &cfg), 0.013);
+	/* 13.003 ms gaps are within a clean link's noise of the rate and snap too. */
+	Smooth_Init (&s);
+	for (i = 0, t = 1.0; i <= 100; i++, t += 0.013003)
+		Smooth_Arrived (&s, t, &cfg);
+	CHECK_NEAR (Smooth_Interval (&s, t, &cfg), 0.013);
+	/* 13.04 ms gaps are slower by more than that: snapping would release
+	   faster than the client sends, so the measured interval stands. */
+	Smooth_Init (&s);
+	for (i = 0, t = 1.0; i <= 100; i++, t += 0.01304)
+		Smooth_Arrived (&s, t, &cfg);
+	CHECK (fabs (Smooth_Interval (&s, t, &cfg) - 0.01304 * 1.002) < 1e-6);
+	/* 12 ms gaps are a different rate and get the measured interval. */
+	Smooth_Init (&s);
+	for (i = 0, t = 1.0; i <= 100; i++, t += 0.012)
+		Smooth_Arrived (&s, t, &cfg);
+	CHECK (fabs (Smooth_Interval (&s, t, &cfg) - 0.012 * 1.002) < 1e-6);
+}
+
+static void test_draining_never_moves_a_release_earlier_than_the_last (void)
+{
+	/* A large pending drain and a drain cap of a whole slot: in catch-up
+	   mode the shave is still held under half a slot. */
+	smooth_config_t cfg;
+	smooth_t s;
+	queue_t q = {{0}, 0};
+	double t, previous = 1.0;
+	int i, n;
+
+	Smooth_Config (&cfg, 10, 20, 1000, 100);
+	Smooth_Init (&s);
+	CHECK (arrive (&s, &q, 1.0, &cfg));
+	for (i = 0; i < 20; i++)
+		CHECK (!arrive (&s, &q, 1.0, &cfg));
+	s.drain = 0.1;
+
+	for (t = 1.0; q.count; t += 0.0005)
+	{
+		n = release (&s, &q, t, &cfg, NULL);
+		CHECK (n <= 1);
+		if (n)
+		{
+			CHECK (t - previous >= 0.0025 - 1e-9);
+			previous = t;
+		}
+	}
+}
+
+static void test_slack_is_replaced_each_period_and_forgotten_when_the_queue_runs_dry (void)
+{
+	smooth_config_t cfg;
+	smooth_t s;
+
+	Smooth_Config (&cfg, 10, 50, 200, 10);
+	Smooth_Init (&s);
+	/* Each release waited 5 ms. Closing a period schedules that slack,
+	   and the release that closes it shaves 1 ms (10% of a 10 ms slot). */
+	Smooth_Released (&s, 1.0, 1.0 - 0.005, 0, 0, &cfg);
+	Smooth_Released (&s, 1.5, 1.5 - 0.005, 0, 0, &cfg);
+	CHECK_NEAR (s.drain, 0.004);
+	/* The next period sees the same slack: it replaces what is pending
+	   rather than adding to it (7 ms if it added). */
+	Smooth_Released (&s, 1.501, 1.501 - 0.005, 0, 0, &cfg);
+	Smooth_Released (&s, 2.001, 2.001 - 0.005, 0, 0, &cfg);
+	CHECK_NEAR (s.drain, 0.004);
+	/* A packet passing straight through means there is no slack left. */
+	s.next_release = 0;
+	CHECK (Smooth_PassThrough (&s, 3.0, &cfg));
+	CHECK_NEAR (s.drain, 0);
+}
+
 static void test_clumped_arrivals_leave_at_the_client_rate (void)
 {
 	/* 77 packets/s through an uplink with a 20 ms slot: after the rate is
@@ -424,6 +507,9 @@ int main (void)
 	test_burst_is_spread_and_catch_up_doubles_the_rate ();
 	test_stale_packets_are_dropped_oldest_first ();
 	test_interval_is_the_measured_rate_once_known ();
+	test_a_client_near_the_configured_rate_is_taken_to_be_at_it ();
+	test_draining_never_moves_a_release_earlier_than_the_last ();
+	test_slack_is_replaced_each_period_and_forgotten_when_the_queue_runs_dry ();
 	test_clumped_arrivals_leave_at_the_client_rate ();
 	test_backlog_drains_at_the_measured_rate ();
 	test_series_summary_and_window ();

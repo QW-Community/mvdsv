@@ -420,15 +420,17 @@ static void SV_ReleaseSmoothedPackets (client_t *cl, qbool drain, const smooth_c
 	}
 }
 
-// How long the main loop may sleep, in ms, before a smoothed packet is due.
-int SV_SmoothSleepMs (int max_ms)
+// How long the main loop may sleep, in microseconds, before a smoothed packet
+// is due. Microseconds, not milliseconds: rounding a release up to the next
+// millisecond would show as jitter in the spacing between packets.
+int SV_SmoothSleepUs (int max_us)
 {
 	client_t *cl;
-	double now, wait = max_ms / 1000.0;
+	double now, wait = max_us / 1000000.0;
 	int i;
 
 	if (sv.state != ss_active)
-		return max_ms;
+		return max_us;
 
 	now = Sys_DoubleTime();
 	for (i = 0, cl = svs.clients; i < MAX_CLIENTS; i++, cl++)
@@ -438,7 +440,7 @@ int SV_SmoothSleepMs (int max_ms)
 		if (cl->smooth.next_release - now < wait)
 			wait = cl->smooth.next_release - now;
 	}
-	return wait <= 0 ? 0 : (int)ceil(wait * 1000);
+	return wait <= 0 ? 0 : (int)ceil(wait * 1000000);
 }
 
 /*

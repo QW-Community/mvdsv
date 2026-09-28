@@ -18,6 +18,16 @@ Connection smoothing, see sv_smooth.h.
    only builds slack, which is drained, while a short one runs the queue dry
    and re-syncs the schedule to a clumped arrival. */
 #define RATE_MARGIN      1.002
+/* A client measured at the configured rate, up to this much faster or a
+   sliver slower, is taken to be exactly at it. A stock QuakeWorld client
+   sends at precisely the configured rate, so using it as is spares that
+   client the margin and the slack it builds. The measurement of it wobbles
+   by a few tenths of a percent as clumps enter and leave the window, which
+   the faster side covers; the slower side is kept to what a clean link's
+   noise needs, since a schedule shorter than the client's interval drains
+   the buffer a clumped link relies on, and that must stay negligible. */
+#define RATE_SNAP_FASTER 0.005
+#define RATE_SNAP_SLOWER 0.0005
 /* How often the slack in the queue is measured and scheduled for draining. */
 #define SLACK_PERIOD     0.5
 /* Slack is shaved off each slot by this share of what is left, so a lot of
@@ -91,7 +101,10 @@ double Smooth_Interval (const smooth_t *s, double now, const smooth_config_t *cf
 	Smooth_SeriesSummary (&s->rate, now, &rate);
 	if (rate.count < MIN_RATE_SAMPLES || rate.mean * rate.count < MS (MIN_RATE_SPAN))
 		return cfg->interval;
-	interval = rate.mean * RATE_MARGIN / 1000.0;
+	interval = rate.mean / 1000.0;
+	if (interval >= cfg->interval * (1 - RATE_SNAP_FASTER) && interval <= cfg->interval * (1 + RATE_SNAP_SLOWER))
+		return cfg->interval;
+	interval *= RATE_MARGIN;
 	return interval < 0.001 ? 0.001 : interval > 1.0 ? 1.0 : interval;
 }
 
@@ -106,7 +119,9 @@ static void Smooth_NoteRelease (smooth_t *s, double now, double wait, const smoo
 	s->have_slack = 1;
 	if (now - s->period_start >= SLACK_PERIOD)
 	{
-		s->drain += s->slack < cfg->catchup ? s->slack : cfg->catchup;
+		/* The slack still present is what remains to drain, whatever was
+		   scheduled before; adding would count the same slack twice. */
+		s->drain = s->slack < cfg->catchup ? s->slack : cfg->catchup;
 		s->have_slack = 0;
 		s->period_start = now;
 	}
@@ -125,6 +140,8 @@ int Smooth_PassThrough (smooth_t *s, double now, const smooth_config_t *cfg)
 	if (s->next_release > now)
 		return 0;
 
+	/* The queue ran dry, so there is no slack left to drain. */
+	s->drain = 0;
 	s->next_release = now + Smooth_Interval (s, now, cfg);
 	Smooth_NoteRelease (s, now, 0, cfg);
 	Smooth_Sent (s, now, now);
@@ -146,13 +163,17 @@ void Smooth_Released (smooth_t *s, double now, double arrived, int more_queued, 
 	double backlog = more_queued ? now - next_arrived : 0;
 	double interval = Smooth_Interval (s, now, cfg);
 	double slot = backlog > cfg->catchup ? interval / 2 : interval;
-	double shave = s->drain * DRAIN_SHARE;
+	double shave;
 
 	Smooth_NoteRelease (s, now, now - arrived, cfg);
+	shave = s->drain * DRAIN_SHARE;
 	if (shave < interval * DRAIN_FLOOR)
 		shave = interval * DRAIN_FLOOR;
 	if (shave > interval * cfg->drain)
 		shave = interval * cfg->drain;
+	/* Never so much that this release lands before the previous one was due. */
+	if (shave > slot / 2)
+		shave = slot / 2;
 	if (shave > s->drain)
 		shave = s->drain;
 	s->drain -= shave;

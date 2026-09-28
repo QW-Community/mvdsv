@@ -1168,6 +1168,6 @@ void SV_SetClientConnectionTime(client_t* client);
 
 // connection smoothing (sv_main.c)
 qbool SV_ClientSmoothed (client_t *cl);
-int SV_SmoothSleepMs (int max_ms);
+int SV_SmoothSleepUs (int max_us);
 
 #endif /* !__SERVER_H__ */
