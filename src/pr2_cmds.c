@@ -39,7 +39,6 @@
 const char *pr2_ent_data_ptr;
 vm_t *sv_vm = NULL;
 extern gameData_t gamedata;
-extern sizebuf_t *csqcmsgbuffer;
 
 static int PASSFLOAT(float f)
 {
@@ -85,6 +84,11 @@ static float GETFLOAT(int i)
 typedef intptr_t (*ext_syscall_t)(intptr_t *arg);
 #ifdef FTE_PEXT_CSQC
 static intptr_t EXT_SetSendNeeded(intptr_t *args);
+static intptr_t EXT_SetSendNeeded64(intptr_t *args);
+static intptr_t EXT_clientstat(intptr_t *args);
+static intptr_t EXT_pointerstat(intptr_t *args);
+static intptr_t EXT_globalstat(intptr_t *args);
+static intptr_t EXT_QCRequestArg(intptr_t *args);
 #endif
 static intptr_t EXT_SetLastRuntime(intptr_t *args);
 static intptr_t EXT_ClientReliableCheckBlock(intptr_t *args);
@@ -106,6 +110,11 @@ struct
 	{"GetExtFieldPtr",	EXT_GetExtFieldPtr},
 #ifdef FTE_PEXT_CSQC
 	{"setsendneeded",		EXT_SetSendNeeded},
+	{"setsendneeded64",		EXT_SetSendNeeded64},
+	{"clientstat",			EXT_clientstat},
+	{"pointerstat",			EXT_pointerstat},
+	{"globalstat",			EXT_globalstat},
+	{"qcrequestarg",		EXT_QCRequestArg},
 #endif
 	{"SetLastRuntime",	EXT_SetLastRuntime},
 	{"ClientReliableCheckBlock", EXT_ClientReliableCheckBlock},
@@ -1202,9 +1211,7 @@ MESSAGE WRITING
 #define	MSG_ALL			2		// reliable to all
 #define	MSG_INIT		3		// write to the init string
 #define	MSG_MULTICAST	4		// for multicast()
-#ifdef FTE_PEXT_CSQC
-#define	MSG_CSQC		5		// for csqc
-#endif
+// MSG_CSQC (5) is defined once in server.h, not duplicated here.
 #define MSG_ONE_NORECORD 6		// reliable to one, excluded from MVD
 
 static qbool PF2_IsReliableOne(int dest)
@@ -1248,6 +1255,8 @@ sizebuf_t *WriteDest2(int dest)
 		return &sv.multicast;
 
 	case MSG_CSQC:
+		if (!csqcmsgbuffer || !csqcmsgbuffer->maxsize || !csqcmsgbuffer->data)
+			PR2_RunError("PF_Write_*: MSG_CSQC outside of SendEntity method");
 		return csqcmsgbuffer;
 
 	default:
@@ -1286,8 +1295,48 @@ static intptr_t EXT_ClientReliableCheckBlock(intptr_t *args)
 	return !cl->netchan.message.overflowed;
 }
 
+#ifdef FTE_PEXT_CSQC
+/*
+====================
+PF2_WriteCheckCSQC
+
+Classify the first byte written into a fresh multicast buffer: svc 83 starts a
+CSQC packet (PF2_multicast then routes it through SV_CSQCMulticast so only CSQC
+clients receive it), any other value a normal one. Only the first byte is
+inspected, so a payload byte equal to 0x53 is never mistaken for the svc.
+
+Writing svc 83 to a broadcast destination is a mod contract violation: it would
+bypass the CSQC client filter. MSG_ONE/MSG_INIT are accumulating streams whose
+message boundary cannot be recovered, so they cannot be checked here (the mod
+contract forbids CSQC packets there; see g_csqc.h in the mod). The broadcast
+check only sees a cgamepacket written while the destination is still empty; a
+mod that writes any other message first is not caught, so this is a
+non-fatal warning rather than an error.
+====================
+*/
+static void PF2_WriteCheckCSQC (int to, int data)
+{
+	if (to == MSG_MULTICAST)
+	{
+		if (sv.multicast.cursize == 0 && data == svc_fte_cgamepacket)
+			sv.multicast_csqc = true;
+	}
+	else if ((to == MSG_BROADCAST || to == MSG_ALL) && data == svc_fte_cgamepacket)
+	{
+		sizebuf_t *d = WriteDest2(to);
+
+		if (d && d->cursize == 0)
+			Con_DPrintf("WARNING: CSQC packet written to a broadcast destination, "
+				"send it with multicast()\n");
+	}
+}
+#endif
+
 void PF2_WriteByte(int to, int data)
 {
+#ifdef FTE_PEXT_CSQC
+	PF2_WriteCheckCSQC(to, data);
+#endif
 	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
@@ -1307,6 +1356,9 @@ void PF2_WriteByte(int to, int data)
 
 void PF2_WriteChar(int to, int data)
 {
+#ifdef FTE_PEXT_CSQC
+	PF2_WriteCheckCSQC(to, data);
+#endif
 	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
@@ -1426,7 +1478,23 @@ void PF2_WriteString(int to, char *data)
 		}
 	}
 	else
-		MSG_WriteString(WriteDest2(to), data);
+	{
+		sizebuf_t *dest = WriteDest2(to);
+		int len = (data && *data) ? (int)strlen(data) + 1 : 1;
+
+		// SZ_GetSpace Sys_Errors when a *single* write exceeds
+		// maxsize even with allowoverflow (csqcmsgbuffer is only MAX_DATAGRAM).
+		// Such a payload can never fit the client datagram anyway, so for
+		// allowoverflow destinations mark it overflowed and drop it instead of
+		// killing the server. Non-overflow destinations keep the old Sys_Error.
+		if (dest->allowoverflow && len > dest->maxsize)
+		{
+			SZ_Clear(dest);
+			dest->overflowed = true;
+			return;
+		}
+		MSG_WriteString(dest, data);
+	}
 }
 
 void PF2_WriteEntity(int to, int data)
@@ -1732,7 +1800,15 @@ void PF2_multicast(float x, float y, float z, int to)
 	o[0] = x;
 	o[1] = y;
 	o[2] = z;
-	SV_Multicast(o, to);
+#ifdef FTE_PEXT_CSQC
+	// A CSQC packet (first byte svc_fte_cgamepacket) goes to CSQC clients only.
+	// MULTICAST_MVD_HIDDEN is a raw hidden block, not a CSQC packet, so it is
+	// never routed here even if its first byte happens to be 0x53.
+	if (sv.multicast_csqc && to != MULTICAST_MVD_HIDDEN)
+		SV_CSQCMulticast (o, to);
+	else
+#endif
+		SV_Multicast (o, to);
 }
 
 /*
@@ -2063,39 +2139,108 @@ intptr_t PF2_FS_GetFileList(char *path, char *ext,
 }
 
 #ifdef FTE_PEXT_CSQC
-intptr_t EXT_SetSendNeeded(intptr_t *args)
+// Keep mod flags unshifted until selecting the destination: EZCSQC stores
+// a 32-bit mask directly, while generic CSQC reserves its low two bits.
+static void EXT_SetSendNeeded_Client(client_t *cl, unsigned int subject, uint64_t flags)
 {
-	unsigned int subject = args[1];
-	int fl = args[2];
-	unsigned int to = args[3];
+	if (cl->state < cs_connected)
+		return;
 
-	if (!subject || subject >= MAX_EDICTS || !fl)
-		return 0;
+	if (SV_ClientSupportsEZCSQC(cl))
+	{
+		uint32_t ezflags = (uint32_t)flags;
+		if (ezflags)
+		{
+			cl->csqcentitysendflags[subject] |= ezflags;
+			cl->csqcentityscope[subject] |= SCOPE_WANTUPDATE;
+		}
+	}
+	else if (SV_ClientUsesGenericCSQC(cl) && cl->pendingcsqcbits
+		&& subject < (unsigned int)cl->max_net_ents)
+		cl->pendingcsqcbits[subject] |= flags << SENDFLAGS_SHIFT;
+}
+
+static void EXT_SetSendNeeded_Apply(unsigned int subject, uint64_t flags, unsigned int to)
+{
+	if (!subject || subject >= MAX_EDICTS || !flags)
+		return;
 
 	if (!to)
-	{	//broadcast
-		for (to = 0; to < MAX_CLIENTS; to++)
-		{
-			if (svs.clients[to].state < cs_connected || !SV_ClientSupportsEZCSQC(&svs.clients[to]))
-				continue;
-
-			svs.clients[to].csqcentitysendflags[subject] |= fl;
-			svs.clients[to].csqcentityscope[subject] |= SCOPE_WANTUPDATE;
-		}
-	}
-
-	else
 	{
-		to--;
-		if (to >= MAX_CLIENTS)
-			;	//some kind of error.
-		else if (SV_ClientSupportsEZCSQC(&svs.clients[to]))
-		{
-			svs.clients[to].csqcentitysendflags[subject] |= fl;
-			svs.clients[to].csqcentityscope[subject] |= SCOPE_WANTUPDATE;
-		}
+		unsigned int i;
+		for (i = 0; i < MAX_CLIENTS; i++)
+			EXT_SetSendNeeded_Client(&svs.clients[i], subject, flags);
 	}
+	else if (to <= MAX_CLIENTS)
+		EXT_SetSendNeeded_Client(&svs.clients[to - 1], subject, flags);
+}
+
+intptr_t EXT_SetSendNeeded(intptr_t *args)
+{
+	// trap_SetSendNeeded(subject, flags, to)
+	//   subject - entity number to flag
+	//   flags   - changed-field bits (shifted by SENDFLAGS_SHIFT on resend)
+	//   to      - 0 = broadcast, 1..N = specific client
+	unsigned int subject = (unsigned int)args[1];
+	// args[] are intptr_t and both VM backends sign-extend the mod's 32-bit
+	// value (vm_interpreted.c / vm_x86.c movsxd), so a mask with bit31 set must
+	// be re-cast to uint32_t first or it would pollute bits 32..63.
+	uint64_t fl = (uint64_t)(uint32_t)args[2];
+	unsigned int to = (unsigned int)args[3];
+
+	EXT_SetSendNeeded_Apply(subject, fl, to);
 	return 0;
+}
+
+// trap_SetSendNeeded64(subject, flagslo, flagshi, to)
+ //   64-bit setsendneeded variant: the mod's mask (62 usable bits: lo = 0..31,
+ //   hi = 32..61) is passed as two ints, since VM word sizes (native and QVM)
+ //   are 32-bit. PRESENT/REMOVED (bits 0..1 of the pending word) are engine-side,
+ //   so the mask is trimmed to 62 bits BEFORE the shift to avoid touching them.
+intptr_t EXT_SetSendNeeded64(intptr_t *args)
+{
+	unsigned int subject = (unsigned int)args[1];
+	uint64_t fl = ((uint64_t)(uint32_t)args[2]) | ((uint64_t)(uint32_t)args[3] << 32);
+	unsigned int to = (unsigned int)args[4];
+
+	fl &= (SENDFLAGS_USABLE >> SENDFLAGS_SHIFT);
+
+	EXT_SetSendNeeded_Apply(subject, fl, to);
+	return 0;
+}
+
+// trap_clientstat(statnum, type, fieldoffset)
+intptr_t EXT_clientstat(intptr_t *args)
+{
+	SV_QCStatFieldIdx (args[2], args[3], args[1]);
+	return 0;
+}
+
+// trap_pointerstat(statnum, type, ptr)
+intptr_t EXT_pointerstat(intptr_t *args)
+{
+	void *ptr = VM_ArgPtr(args[3]);
+	SV_QCStatPtr (args[2], ptr, args[1]);
+	return 0;
+}
+
+// trap_globalstat(statnum, type, name)
+intptr_t EXT_globalstat(intptr_t *args)
+{
+	SV_QCStatGlobal (args[2], VMA(3), args[1]);
+	return 0;
+}
+
+// trap_qcrequestarg(idx, buf, size): copies argument idx of the qcrequest
+// currently being dispatched into the mod's buf and returns its type
+// (QCREQ_T_*, or -1 on out-of-range idx). Only meaningful inside the
+// GAME_QCREQUEST callback.
+intptr_t EXT_QCRequestArg(intptr_t *args)
+{
+	if (args[3] <= 0)
+		return -1;	// negative size would skip VM_CheckBounds and turn into a huge dstsize
+	VM_CheckBounds(sv_vm, args[2], args[3]);
+	return SV_QCRequestArg(args[1], VMA(2), args[3]);
 }
 #endif
 
@@ -2194,6 +2339,10 @@ static intptr_t EXT_MapExtFieldPtr(intptr_t *args)
 		if (!strcmp(key, "colormod"))
 		{
 			return offsetof(ext_entvars_t, colourmod) | GetExtFieldCookie();
+		}
+		if (!strcmp(key, "sendflags"))
+		{
+			return offsetof(ext_entvars_t, sendflags) | GetExtFieldCookie();
 		}
 		if (!strcmp(key, "SendEntity"))
 		{

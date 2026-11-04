@@ -235,13 +235,39 @@ static unsigned SV_CheckModel(char *mdl)
 }
 
 #ifdef FTE_PEXT_CSQC
+// CSQC is only meaningful for a PR2 mod (native/QVM). A PR1 classic progs.dat
+// cannot drive CSQC, so with it loaded we must not load/announce csprogs and
+// must not advertise FTE_PEXT_CSQC to clients.
+qbool SV_CSQCActive(void)
+{
+	return sv_vm != NULL;
+}
+
+void SV_UpdateCSQCExtension(void)
+{
+	if (sv_vm)
+		svs.fteprotocolextensions |= FTE_PEXT_CSQC;
+	else
+		svs.fteprotocolextensions &= ~FTE_PEXT_CSQC;
+}
+
 static void SV_LoadCSQC(void)
 {
 	extern cvar_t sv_csqc_progname;
+	byte *file;
 	int size;
 
-	byte *file = FS_LoadTempFile(sv_csqc_progname.string, &size);
-	if (file)
+	// "no csprogs" state (checksum 0 + empty star keys) covers both the PR1
+	// (no CSQC at all) and the missing-csprogs-file cases; set it in one place.
+	if (!SV_CSQCActive() || !(file = FS_LoadTempFile(sv_csqc_progname.string, &size)))
+	{
+		sv.csqcchecksum = 0;
+		Info_SetValueForStarKey(svs.info, "*csprogs", "", MAX_SERVERINFO_STRING);
+		Info_SetValueForStarKey(svs.info, "*csprogssize", "", MAX_SERVERINFO_STRING);
+		Info_SetValueForStarKey(svs.info, "*csprogsname", "", MAX_SERVERINFO_STRING);
+		return;
+	}
+
 	{
 		char text[64];
 		sv.csqcchecksum = Com_BlockChecksum(file, size);
@@ -250,13 +276,6 @@ static void SV_LoadCSQC(void)
 		sprintf(text, "0x%x", (unsigned int)size);
 		Info_SetValueForStarKey(svs.info, "*csprogssize", text, MAX_SERVERINFO_STRING);
 		Info_SetValueForStarKey(svs.info, "*csprogsname", sv_csqc_progname.string, MAX_SERVERINFO_STRING);
-	}
-	else
-	{
-		sv.csqcchecksum = 0;
-		Info_SetValueForStarKey(svs.info, "*csprogs", "", MAX_SERVERINFO_STRING);
-		Info_SetValueForStarKey(svs.info, "*csprogssize", "", MAX_SERVERINFO_STRING);
-		Info_SetValueForStarKey(svs.info, "*csprogsname", "", MAX_SERVERINFO_STRING);
 	}
 }
 #endif
@@ -419,10 +438,6 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 
 	sv.time = 1.0;
 
-#ifdef FTE_PEXT_CSQC
-	SV_LoadCSQC();
-#endif
-
 	// load progs to get entity field count
 	// which determines how big each edict is
 	// and allocate edicts
@@ -431,6 +446,13 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 	PR_InitPatchTables();
 #endif
 	PR_InitProg();
+
+#ifdef FTE_PEXT_CSQC
+	// after progs are loaded we know whether the mod is PR2 (CSQC-capable) or
+	// PR1 (.dat, no CSQC); recompute the advertised extension and csprogs keys.
+	SV_UpdateCSQCExtension();
+	SV_LoadCSQC();
+#endif
 
 	for (i = 0; i < sv.max_edicts; i++)
 	{
@@ -544,7 +566,7 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 	}
 #endif
 #ifdef FTE_PEXT_CSQC
-	svs.fteprotocolextensions |= FTE_PEXT_CSQC;
+	SV_UpdateCSQCExtension();
 #endif
 
 	// find optional QC-exported functions.
@@ -578,6 +600,30 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 #endif
 		//ZOID - make sure we update frags right
 		svs.clients[i].old_frags = 0;
+
+#ifdef FTE_PEXT_CSQC
+		// A new map (and possibly a new mod type) is being
+		// spawned. The client's CSQC run state is per-level: csprogs is shut
+		// down by the client on map change and re-armed via enablecsqc only
+		// after it sees a fresh *csprogs. Reset csqcactive/bitset here so a
+		// switch to a PR1 mod does not keep emitting svc 76 into the first
+		// frame of the new level (client then dies with "csprogsvers/0.dat
+		// required"). On a PR2 map the client re-arms CSQC itself.
+		//
+		// fteprotocolextensions is negotiated once at connect and never
+		// re-sent, so it is left untouched here: dropping FTE_PEXT_CSQC on a
+		// PR1 map would permanently disable CSQC for a client that connected
+		// on PR2, and a PR1 qcrequest is swallowed (not dropped) anyway.
+		svs.clients[i].csqcactive = false;
+		svs.clients[i].ezcsqc_ready = false;
+		SV_ResetGenericCSQCState(&svs.clients[i]);
+		if (svs.clients[i].pendingcsqcbits)
+		{
+			Q_free(svs.clients[i].pendingcsqcbits);
+			svs.clients[i].pendingcsqcbits = NULL;
+		}
+		svs.clients[i].max_net_ents = 0;
+#endif
 	}
 
 	// fill sv.mapname and sv.modelname with new map name

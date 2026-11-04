@@ -69,7 +69,7 @@ typedef struct
 	float	colourmod[3];	// r,g,b [0.0 .. 1.0], > 1 overbright
 #ifdef FTE_PEXT_CSQC
 	int		SendEntity;		// Trigger GAME_CSQCSEND indirection
-	int		sendflags;		//
+	float	sendflags[3];	// QC vector SendFlags (cleared by SV_CleanupEnts)
 	float	pvsflags;		// CSQC pvsflags
 #endif
 } ext_entvars_t;
