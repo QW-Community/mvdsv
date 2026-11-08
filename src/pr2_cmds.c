@@ -99,6 +99,7 @@ static intptr_t EXT_SprayClearAll(intptr_t *args);
 #endif
 static intptr_t EXT_SetExtFieldPtr(intptr_t *args);
 static intptr_t EXT_GetExtFieldPtr(intptr_t *args);
+static intptr_t EXT_RailTrail(intptr_t *args);
 struct
 {
 	char *extname;
@@ -108,6 +109,7 @@ struct
 	{"MapExtFieldPtr",	EXT_MapExtFieldPtr},
 	{"SetExtFieldPtr",	EXT_SetExtFieldPtr},
 	{"GetExtFieldPtr",	EXT_GetExtFieldPtr},
+	{"railtrail",		EXT_RailTrail},
 #ifdef FTE_PEXT_CSQC
 	{"setsendneeded",		EXT_SetSendNeeded},
 	{"setsendneeded64",		EXT_SetSendNeeded64},
@@ -2369,6 +2371,22 @@ static intptr_t EXT_SprayClearAll(intptr_t *args)
 	return 1;
 }
 #endif
+
+/* Explicit rail requests leave client and recording formats to the server. */
+static intptr_t EXT_RailTrail(intptr_t *args)
+{
+	vec3_t start, end;
+	int player = args[7] >= 0 && args[7] <= MAX_CLIENTS ? (int)args[7] : 0;
+	int color = args[8] >= 1 && args[8] <= 7 ? (int)args[8] : 1;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		start[i] = _vmf(args[i + 1]);
+		end[i] = _vmf(args[i + 4]);
+	}
+	SV_RailTrail(start, end, player, color);
+	return 0;
+}
 
 /*
   int trap_Map_Extension( const char* ext_name, int mapto)

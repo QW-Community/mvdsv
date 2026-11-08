@@ -327,7 +327,11 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 	NET_InitServer();
 #endif
 
+	SV_MVD_FinishMap();
 	SV_SaveSpawnparms ();
+	for (i = 0; i < MAX_CLIENTS; ++i) {
+		SV_RD_ClearClient(&svs.clients[i]);
+	}
 	SV_LoadAccounts();
 
 #ifdef USE_PR2
@@ -655,10 +659,13 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 	{
 		extern cvar_t sv_extlimits, sv_bspversion;
 
+		sv.max_edicts = min(sv.max_edicts, (int)sv_maxedicts.value);
 		if (sv_extlimits.value == 0 || (sv_extlimits.value == 2 && sv_bspversion.value < 2)) {
 			sv.max_edicts = min(sv.max_edicts, MAX_EDICTS_SAFE);
 		}
 	}
+
+	SV_MVD_ConfigureMap();
 
 	sv.checkpvs = (byte *)Hunk_AllocName(CM_PVSRowBytes(), "checkpvs");
 
@@ -788,7 +795,7 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 
 		/* Unsettled pext clients are checked by signon after negotiation. */
 		if (client->state >= cs_preconnected && !client->process_pext) {
-			SV_CheckClientSoundSupport(client);
+			SV_CheckClientMapSupport(client);
 		}
 	}
 
