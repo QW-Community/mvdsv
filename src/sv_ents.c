@@ -1048,17 +1048,25 @@ static qbool SV_AddCSQCUpdate (client_t *client, edict_t *ent)
 =============
 SV_EmitDeltaEntIndex
 
-Writes a single entity index for the CSQC lump. 0x8000 flags a remove.
-The highest map slot is 16383, below the extended-index marker (0x4000).
+Writes a CSQC index. RD uses a third byte for slots above 16383;
+other profiles use the ordinary two-byte index.
+The caller reserves room for the index and the terminating short.
 =============
 */
-static void SV_EmitDeltaEntIndex (sizebuf_t *msg, unsigned int entnum, qbool remove)
+static void SV_EmitDeltaEntIndex (sizebuf_t *msg, unsigned int entnum, qbool remove, qbool extended_indices)
 {
-	unsigned int rflag = remove ? 0x8000 : 0;
-	MSG_WriteShort (msg, entnum | rflag);
+	unsigned int rflag = remove ? RD_ENTITYINDEX_REMOVE : 0;
+	if (extended_indices && entnum >= RD_ENTITYINDEX_EXTEND)
+	{
+		MSG_WriteShort (msg, (entnum & RD_ENTITYINDEX_MASK) | RD_ENTITYINDEX_EXTEND | rflag);
+		MSG_WriteByte (msg, entnum >> 14);
+	}
+	else
+	{
+		MSG_WriteShort (msg, entnum | rflag);
+	}
 }
 
-#ifdef FTE_PEXT_CSQC
 // Record one entity update emitted into the current frame's datagram so a
 // lost packet can re-flag it (FTE SV_EmitCSQCUpdate resend[]). The entry keeps
 // the entity number plus a remove flag; on drop a remove is re-flagged
@@ -1182,6 +1190,10 @@ static qbool SV_CSQC_EmitRemove (client_t *client, sizebuf_t *msg, int svcnumber
                                  qbool *writtenheader, client_frame_t *logframe, int e)
 {
 	uint64_t bits;
+	qbool extended_indices = (client->fteprotocolextensions2 & FTE_PEXT2_REPLACEMENTDELTAS) != 0;
+	/* Opcode (1) + largest index (2 legacy / 3 RD) + zero terminator (2).
+	 * Keep the opcode allowance even after the first record. */
+	int reserve = extended_indices ? 6 : 5;
 
 	if (e >= client->max_net_ents)
 		return true;
@@ -1200,7 +1212,7 @@ static qbool SV_CSQC_EmitRemove (client_t *client, sizebuf_t *msg, int svcnumber
 			return true;	// client keeps it; only a remove-resend may take it away
 	}
 
-	if (msg->cursize + 5 >= msg->maxsize)
+	if (msg->cursize + reserve >= msg->maxsize)
 		return false;
 
 	if (!*writtenheader)
@@ -1209,19 +1221,18 @@ static qbool SV_CSQC_EmitRemove (client_t *client, sizebuf_t *msg, int svcnumber
 		MSG_WriteByte (msg, svcnumber);
 	}
 
-	SV_EmitDeltaEntIndex (msg, e, true);
+	SV_EmitDeltaEntIndex (msg, e, true, extended_indices);
 	SV_CSQC_LogAdd (client, logframe, e, true);
 	client->pendingcsqcbits[e] = 0;
 	return true;
 }
-#endif
 
 /*
 =============
 SV_EmitCSQCUpdate
 
-Writes the svc_fte_csqcentities lump (delta compressed against the
-persistent per-client pendingcsqcbits[]).
+Writes CSQC entity updates, optionally with per-entity payload lengths.
+Uses the persistent per-client pendingcsqcbits[].
 =============
 */
 static void SV_EmitCSQCUpdate (client_t *client, sizebuf_t *msg, int svcnumber, qbool allow_removes)
@@ -1233,9 +1244,11 @@ static void SV_EmitCSQCUpdate (client_t *client, sizebuf_t *msg, int svcnumber, 
 	qbool writtenheader = false;
 	uint64_t bits;
 	client_frame_t *logframe;
-	// per-entity datagram reservation: header(1) + entindex(2) + trailing 0(2),
-	// plus the 2-byte length prefix only the sized (92) variant writes.
-	int reserve = (svcnumber == svc_fte_csqcentities_sized) ? 7 : 5;
+	qbool extended_indices = (client->fteprotocolextensions2 & FTE_PEXT2_REPLACEMENTDELTAS) != 0;
+	/* Worst case: opcode (1), index (2 legacy / 3 RD), zero terminator (2).
+	 * Sized updates add a 2-byte payload length; removes carry no length. */
+	int remove_reserve = extended_indices ? 6 : 5;
+	int reserve = remove_reserve + ((svcnumber == svc_fte_csqcentities_sized) ? 2 : 0);
 	int en, entnum;
 	qbool full = false;
 
@@ -1371,7 +1384,7 @@ static void SV_EmitCSQCUpdate (client_t *client, sizebuf_t *msg, int svcnumber, 
 				writtenheader = true;
 				MSG_WriteByte (msg, svcnumber);
 			}
-			SV_EmitDeltaEntIndex (msg, e, false);
+			SV_EmitDeltaEntIndex (msg, e, false, extended_indices);
 			if (svcnumber == svc_fte_csqcentities_sized)	// optional extra length prefix
 			{
 				if (!scratch.cursize)
@@ -1388,7 +1401,7 @@ static void SV_EmitCSQCUpdate (client_t *client, sizebuf_t *msg, int svcnumber, 
 		}
 		else if ((bits & SENDFLAGS_PRESENT) && !((int)ent->xv.pvsflags & PVSF_NOREMOVE))
 		{	// don't want to send, but they have it already
-			if (msg->cursize + 5 >= msg->maxsize)
+			if (msg->cursize + remove_reserve >= msg->maxsize)
 			{
 				client->pendingcsqcbits[e] = bits;
 				full = true;
@@ -1401,7 +1414,7 @@ static void SV_EmitCSQCUpdate (client_t *client, sizebuf_t *msg, int svcnumber, 
 				MSG_WriteByte (msg, svcnumber);
 			}
 
-			SV_EmitDeltaEntIndex (msg, e, true);
+			SV_EmitDeltaEntIndex (msg, e, true, extended_indices);
 			SV_CSQC_LogAdd (client, logframe, e, true);
 		}
 	}
